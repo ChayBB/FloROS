@@ -1,10 +1,25 @@
 import { Router, Request, Response } from 'express';
+import Database from 'better-sqlite3';
 import { getDatabase, now, generateShortId, getSettingValue } from '../db';
 import { v4 as uuidv4 } from 'uuid';
 import { requireRole } from '../middleware/security';
 import { getActiveCountryPack, hasConfiguredTaxCategories } from '../services/tax';
 
 const router = Router();
+
+// Sections of a single-file menu bundle, in dependency order.
+const MENU_SECTIONS = ['categories', 'products', 'addons'] as const;
+type MenuSection = typeof MENU_SECTIONS[number];
+
+export interface CsvImportResult {
+  created: number;
+  updated: number;
+  reactivated: number;
+  skipped: number;
+  failed: number;
+  errors: string[];
+  [extra: string]: number | string[] | undefined;
+}
 
 const VALID_TAX_BEHAVIORS = ['country_default', 'inclusive', 'exclusive', 'exempt'];
 
@@ -249,6 +264,12 @@ const TEMPLATES: Record<string, string> = {
 
 router.get('/template/:type', requireRole('owner', 'manager'), (req: Request, res: Response) => {
   const type = req.params.type as string;
+  if (type === 'menu') {
+    const bundle = MENU_SECTIONS.map((section) => `#SECTION,${section}\n${TEMPLATES[section]}`).join('\n\n');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="menu-template.csv"');
+    return res.send(bundle);
+  }
   const csv = TEMPLATES[type];
   if (!csv) return res.status(404).json({ error: 'Unknown template type' });
   res.setHeader('Content-Type', 'text/csv');
@@ -258,92 +279,93 @@ router.get('/template/:type', requireRole('owner', 'manager'), (req: Request, re
 
 // ─── Export ──────────────────────────────────────────────────────────────────
 
+function buildCategoriesCsv(db: Database.Database): string {
+  const rows = db.prepare('SELECT * FROM categories WHERE deleted_at IS NULL ORDER BY sort_order, name').all() as any[];
+  const lines = ['name,description,color,icon,sort_order'];
+  for (const c of rows) lines.push(toCsvRow([c.name, c.description, c.color, c.icon, c.sort_order]));
+  return lines.join('\n');
+}
+
+function buildProductsCsv(db: Database.Database): string {
+  const rows = db.prepare(
+    `SELECT p.*, c.name AS category_name FROM products p LEFT JOIN categories c ON p.category_id = c.id
+     WHERE p.deleted_at IS NULL ORDER BY c.sort_order, p.sort_order, p.name`
+  ).all() as any[];
+  const lines = ['id,sku,name,category,price,description,cost,tax_category,tax_behavior,cashback_percent,tags,is_active'];
+  for (const p of rows) {
+    let tags = '';
+    if (p.tags) { try { const t = JSON.parse(p.tags); tags = Array.isArray(t) ? t.join(',') : p.tags; } catch { tags = p.tags; } }
+    lines.push(toCsvRow([p.id, p.sku, p.name, p.category_name, p.price, p.description, p.cost,
+      p.tax_category_id ?? '', p.tax_behavior ?? '', p.cb_percent !== null ? p.cb_percent : '', tags, p.is_active ? 'yes' : 'no']));
+  }
+  return lines.join('\n');
+}
+
+function buildAddonsCsv(db: Database.Database): string {
+  const groups = db.prepare('SELECT * FROM addon_groups WHERE is_active = 1 ORDER BY sort_order, name').all() as any[];
+  const lines = ['group_name,addon_name,price,group_required,group_min_select,group_max_select'];
+  for (const g of groups) {
+    const addons = db.prepare('SELECT * FROM addons WHERE addon_group_id = ? AND is_active = 1 ORDER BY sort_order, name').all(g.id) as any[];
+    for (const a of addons) lines.push(toCsvRow([g.name, a.name, a.price, g.is_required ? 'yes' : 'no', g.min_selection, g.max_selection]));
+  }
+  return lines.join('\n');
+}
+
+const CSV_EXPORT_BUILDERS: Record<MenuSection, (db: Database.Database) => string> = {
+  categories: buildCategoriesCsv, products: buildProductsCsv, addons: buildAddonsCsv,
+};
+
+function sendCsv(res: Response, filename: string, body: string): void {
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(body);
+}
+
 router.get('/export/categories', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
-  try {
-    const db = getDatabase();
-    const rows = db
-      .prepare('SELECT * FROM categories WHERE deleted_at IS NULL ORDER BY sort_order, name')
-      .all() as any[];
-    const lines = ['name,description,color,icon,sort_order'];
-    for (const c of rows)
-      lines.push(toCsvRow([c.name, c.description, c.color, c.icon, c.sort_order]));
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="categories-export.csv"');
-    res.send(lines.join('\n'));
-  } catch (err: any) {
-    console.error('[API] Menu CSV export failed:', err);
-    res.status(500).json({ error: 'Menu CSV export failed' });
-  }
+  try { sendCsv(res, 'categories-export.csv', buildCategoriesCsv(getDatabase())); }
+  catch (err: any) { console.error('[API] Menu CSV export failed:', err); res.status(500).json({ error: 'Menu CSV export failed' }); }
 });
-
 router.get('/export/products', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
-  try {
-    const db = getDatabase();
-    const rows = db
-      .prepare(
-        `SELECT p.*, c.name AS category_name
-         FROM products p
-         LEFT JOIN categories c ON p.category_id = c.id
-         WHERE p.deleted_at IS NULL
-         ORDER BY c.sort_order, p.sort_order, p.name`
-      )
-      .all() as any[];
-    const lines = ['id,sku,name,category,price,description,cost,tax_category,tax_behavior,cashback_percent,tags,is_active'];
-    for (const p of rows) {
-      let tags = '';
-      if (p.tags) {
-        try { const t = JSON.parse(p.tags); tags = Array.isArray(t) ? t.join(',') : p.tags; }
-        catch { tags = p.tags; }
-      }
-      lines.push(
-        toCsvRow([p.id, p.sku, p.name, p.category_name, p.price, p.description, p.cost,
-          p.tax_category_id ?? '', p.tax_behavior ?? '',
-          p.cb_percent !== null ? p.cb_percent : '', tags, p.is_active ? 'yes' : 'no'])
-      );
-    }
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="products-export.csv"');
-    res.send(lines.join('\n'));
-  } catch (err: any) {
-    console.error('[API] Menu CSV export failed:', err);
-    res.status(500).json({ error: 'Menu CSV export failed' });
-  }
+  try { sendCsv(res, 'products-export.csv', buildProductsCsv(getDatabase())); }
+  catch (err: any) { console.error('[API] Menu CSV export failed:', err); res.status(500).json({ error: 'Menu CSV export failed' }); }
+});
+router.get('/export/addons', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
+  try { sendCsv(res, 'addons-export.csv', buildAddonsCsv(getDatabase())); }
+  catch (err: any) { console.error('[API] Menu CSV export failed:', err); res.status(500).json({ error: 'Menu CSV export failed' }); }
 });
 
-router.get('/export/addons', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
-  try {
-    const db = getDatabase();
-    const groups = db
-      .prepare('SELECT * FROM addon_groups WHERE is_active = 1 ORDER BY sort_order, name')
-      .all() as any[];
-    const lines = ['group_name,addon_name,price,group_required,group_min_select,group_max_select'];
-    for (const g of groups) {
-      const addons = db
-        .prepare('SELECT * FROM addons WHERE addon_group_id = ? AND is_active = 1 ORDER BY sort_order, name')
-        .all(g.id) as any[];
-      for (const a of addons)
-        lines.push(toCsvRow([g.name, a.name, a.price, g.is_required ? 'yes' : 'no', g.min_selection, g.max_selection]));
-    }
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="addons-export.csv"');
-    res.send(lines.join('\n'));
-  } catch (err: any) {
-    console.error('[API] Menu CSV export failed:', err);
-    res.status(500).json({ error: 'Menu CSV export failed' });
+// ─── Bundle: whole menu in one multi-section CSV ─────────────────────────────
+function buildMenuBundleCsv(db: Database.Database): string {
+  return MENU_SECTIONS.map((section) => `#SECTION,${section}\n${CSV_EXPORT_BUILDERS[section](db)}`).join('\n\n');
+}
+
+function splitMenuBundle(text: string): Partial<Record<MenuSection, string>> {
+  if (typeof text !== 'string' || !text.trim()) throw new CsvImportError('No bundle data provided');
+  const out: Partial<Record<MenuSection, string>> = {};
+  let current: MenuSection | null = null;
+  let buffer: string[] = [];
+  const flush = () => { if (current) out[current] = buffer.join('\n').trim(); buffer = []; };
+  for (const rawLine of text.split(/\r?\n/)) {
+    const marker = rawLine.match(/^#SECTION\s*,\s*([a-z_]+)\s*$/i);
+    if (marker) { flush(); const name = marker[1].toLowerCase() as MenuSection; current = MENU_SECTIONS.includes(name) ? name : null; continue; }
+    if (current) buffer.push(rawLine);
   }
+  flush();
+  if (!Object.keys(out).length) throw new CsvImportError('Bundle has no recognised #SECTION markers (categories, products, addons)');
+  return out;
+}
+
+router.get('/export/menu', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
+  try { sendCsv(res, 'menu-export.csv', buildMenuBundleCsv(getDatabase())); }
+  catch (err: any) { console.error('[API] Menu bundle export failed:', err); res.status(500).json({ error: 'Menu bundle export failed' }); }
 });
 
 // ─── Import ──────────────────────────────────────────────────────────────────
 
-router.post('/import/categories', requireRole('owner', 'manager'), (req: Request, res: Response) => {
-  try {
-    const { csv } = req.body as { csv: string };
-    if (typeof csv !== 'string' || !csv) return res.status(400).json({ error: 'No CSV data provided' });
-
+function importCategoriesCsv(db: Database.Database, csv: string): CsvImportResult {
     const rows = toObjects(parseCSV(csv));
-    if (!rows.length) return res.status(400).json({ error: 'CSV has no data rows' });
+    if (!rows.length) throw new CsvImportError('CSV has no data rows');
 
-    const db = getDatabase();
     let created = 0, updated = 0, reactivated = 0, skipped = 0, failed = 0;
     const errors: string[] = [];
 
@@ -372,25 +394,16 @@ router.post('/import/categories', requireRole('owner', 'manager'), (req: Request
       created++;
     } })();
 
-    res.json({ created, updated, reactivated, skipped, failed, errors });
-  } catch (err: any) {
-    return csvImportErrorResponse(res, err);
-  }
-});
+    return { created, updated, reactivated, skipped, failed, errors };
+}
 
-router.post('/import/products', requireRole('owner', 'manager'), (req: Request, res: Response) => {
-  try {
-    const { csv } = req.body as { csv: string };
-    if (typeof csv !== 'string' || !csv) return res.status(400).json({ error: 'No CSV data provided' });
-
+function importProductsCsv(db: Database.Database, csv: string): CsvImportResult {
     const parsedCsv = parseCSV(csv);
     const headers = new Set((parsedCsv[0] || []).map((header) => header.trim().toLowerCase()));
     const hasTaxCategoryColumn = headers.has('tax_category');
     const hasTaxBehaviorColumn = headers.has('tax_behavior');
     const rows = toObjects(parsedCsv);
-    if (!rows.length) return res.status(400).json({ error: 'CSV has no data rows' });
-
-    const db = getDatabase();
+    if (!rows.length) throw new CsvImportError('CSV has no data rows');
 
     const catRows = db
       .prepare('SELECT id, name FROM categories WHERE deleted_at IS NULL')
@@ -521,26 +534,18 @@ router.post('/import/products', requireRole('owner', 'manager'), (req: Request, 
       created++;
     } })();
 
-    res.json({ created, updated, reactivated, skipped, failed, errors });
-  } catch (err: any) {
-    return csvImportErrorResponse(res, err);
-  }
-});
+    return { created, updated, reactivated, skipped, failed, errors };
+}
 
-router.post('/import/addons', requireRole('owner', 'manager'), (req: Request, res: Response) => {
-  try {
-    const { csv } = req.body as { csv: string };
-    if (typeof csv !== 'string' || !csv) return res.status(400).json({ error: 'No CSV data provided' });
-
+function importAddonsCsv(db: Database.Database, csv: string): CsvImportResult {
     const parsedCsv = parseCSV(csv);
     const headers = new Set((parsedCsv[0] || []).map((header) => header.trim().toLowerCase()));
     const hasGroupRequiredColumn = headers.has('group_required');
     const hasGroupMinColumn = headers.has('group_min_select');
     const hasGroupMaxColumn = headers.has('group_max_select');
     const rows = toObjects(parsedCsv);
-    if (!rows.length) return res.status(400).json({ error: 'CSV has no data rows' });
+    if (!rows.length) throw new CsvImportError('CSV has no data rows');
 
-    const db = getDatabase();
     let groupsCreated = 0, groupsUpdated = 0, addonsCreated = 0;
     let groupsReactivated = 0, addonsReactivated = 0;
     let skipped = 0, failed = 0;
@@ -713,22 +718,54 @@ router.post('/import/addons', requireRole('owner', 'manager'), (req: Request, re
 
     const created = groupsCreated + addonsCreated;
     const reactivated = groupsReactivated + addonsReactivated;
-    res.json({
-      created,
-      updated: groupsUpdated,
-      reactivated,
-      skipped,
-      failed,
-      groups_created: groupsCreated,
-      groups_updated: groupsUpdated,
-      addons_created: addonsCreated,
-      groups_reactivated: groupsReactivated,
-      addons_reactivated: addonsReactivated,
-      errors,
-    });
-  } catch (err: any) {
-    return csvImportErrorResponse(res, err);
-  }
+    return {
+      created, updated: groupsUpdated, reactivated, skipped, failed,
+      groups_created: groupsCreated, groups_updated: groupsUpdated, addons_created: addonsCreated,
+      groups_reactivated: groupsReactivated, addons_reactivated: addonsReactivated, errors,
+    };
+}
+
+const CSV_IMPORTERS: Record<MenuSection, (db: Database.Database, csv: string) => CsvImportResult> = {
+  categories: importCategoriesCsv, products: importProductsCsv, addons: importAddonsCsv,
+};
+
+function importRoute(section: MenuSection) {
+  return (req: Request, res: Response) => {
+    try {
+      const { csv } = req.body as { csv: string };
+      if (typeof csv !== 'string' || !csv) return res.status(400).json({ error: 'No CSV data provided' });
+      res.json(CSV_IMPORTERS[section](getDatabase(), csv));
+    } catch (err: any) { return csvImportErrorResponse(res, err); }
+  };
+}
+
+router.post('/import/categories', requireRole('owner', 'manager'), importRoute('categories'));
+router.post('/import/products', requireRole('owner', 'manager'), importRoute('products'));
+router.post('/import/addons', requireRole('owner', 'manager'), importRoute('addons'));
+
+// ─── Bundle import: split one file, apply sections in dependency order ────────
+router.post('/import/menu', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const { csv } = req.body as { csv: string };
+    if (typeof csv !== 'string' || !csv) return res.status(400).json({ error: 'No bundle data provided' });
+    const sections = splitMenuBundle(csv);
+    const db = getDatabase();
+    const results: Partial<Record<MenuSection, CsvImportResult>> = {};
+    db.transaction(() => {
+      for (const section of MENU_SECTIONS) {
+        const sectionCsv = sections[section];
+        if (sectionCsv === undefined) continue;
+        if (!toObjects(parseCSV(sectionCsv)).length) continue;
+        results[section] = CSV_IMPORTERS[section](db, sectionCsv);
+      }
+    })();
+    const totals = { created: 0, updated: 0, reactivated: 0, skipped: 0, failed: 0 };
+    for (const r of Object.values(results)) {
+      if (!r) continue;
+      totals.created += r.created; totals.updated += r.updated; totals.reactivated += r.reactivated; totals.skipped += r.skipped; totals.failed += r.failed;
+    }
+    res.json({ sections: results, totals });
+  } catch (err: any) { return csvImportErrorResponse(res, err); }
 });
 
 export { router as menuCsvRoutes };
