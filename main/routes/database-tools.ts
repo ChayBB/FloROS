@@ -1,0 +1,110 @@
+import { Router, Request, Response } from 'express';
+import { resetDatabaseWithBackup, listBackups, deleteBackup, getCurrentSchemaVersion } from '../db';
+import { clearInMemoryRevokedTokens, clearUserAuthCache, requireRole } from '../middleware/security';
+import { requireMasterPin } from '../middleware/master-pin';
+import { asyncHandler } from '../middleware/async-handler';
+import { runHealthCheck, applySafeFixes } from '../services/schema-health';
+import { isMasterPinAvailable, isMasterPinSet, resetMasterPin } from '../services/master-pin';
+import { clearJWTSecretCache } from './auth';
+import { getHttpRequestSignal } from '../shutdown';
+
+const router = Router();
+
+// Read-only / additive-only — not master-PIN gated, only owner-gated.
+router.get('/health-check', requireRole('owner'), (_req: Request, res: Response) => {
+  try {
+    res.json(runHealthCheck());
+  } catch (error: any) {
+    console.error('[DB Tools] health-check error:', error);
+    res.status(500).json({ error: 'Health check failed' });
+  }
+});
+
+router.post('/apply-safe-fixes', requireRole('owner'), (req: Request, res: Response) => {
+  try {
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as { findingIds?: unknown };
+    const { findingIds } = body;
+    if (findingIds !== undefined && (!Array.isArray(findingIds) || findingIds.some((id) => typeof id !== 'string'))) {
+      return res.status(400).json({ error: 'findingIds must be an array of finding id strings' });
+    }
+    res.json(applySafeFixes(findingIds as string[] | undefined));
+  } catch (error: any) {
+    console.error('[DB Tools] apply-safe-fixes error:', error);
+    res.status(500).json({ error: 'Applying fixes failed' });
+  }
+});
+
+// Read-only listing of the managed backups/ directory (#120). Not master-PIN
+// gated — same read-only rationale as /health-check.
+router.get('/backups', requireRole('owner'), (_req: Request, res: Response) => {
+  try {
+    res.json({ backups: listBackups() });
+  } catch (error: any) {
+    console.error('[DB Tools] list backups error:', error);
+    res.status(500).json({ error: 'Listing backups failed' });
+  }
+});
+
+// Deletes one backup from the managed backups/ directory (#120) — same
+// master-PIN gate as creating one, since a backup is the safety net a
+// restore/initialize depends on.
+router.post('/backups/:fileName/delete', requireRole('owner'), requireMasterPin, (req: Request, res: Response) => {
+  try {
+    deleteBackup(req.params.fileName as string);
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error('[DB Tools] delete backup error:', error);
+    if (error?.code === 'ERR_INVALID_BACKUP_NAME') {
+      return res.status(400).json({ error: 'Invalid backup file name' });
+    }
+    if (error?.code === 'ERR_BACKUP_NOT_FOUND') {
+      return res.status(404).json({ error: 'Backup not found' });
+    }
+    res.status(500).json({ error: 'Deleting backup failed' });
+  }
+});
+
+router.get('/master-pin/status', requireRole('owner'), (_req: Request, res: Response) => {
+  res.json({ available: isMasterPinAvailable(), isSet: isMasterPinSet(), schemaVersion: getCurrentSchemaVersion() });
+});
+
+router.post('/master-pin/reset', requireRole('owner'), (req: Request, res: Response) => {
+  const { pin, confirm_pin } = req.body as { pin?: string; confirm_pin?: string };
+  const cleanPin = String(pin || '').trim();
+  if (!/^\d{4}$/.test(cleanPin)) {
+    return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+  }
+  if (cleanPin !== confirm_pin) {
+    return res.status(400).json({ error: 'PINs do not match' });
+  }
+  if (!isMasterPinAvailable()) {
+    return res.status(409).json({ error: 'Master PIN is not available on this device' });
+  }
+  try {
+    resetMasterPin(cleanPin);
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error('[DB Tools] set Master PIN error:', error);
+    res.status(500).json({ error: 'Failed to set Master PIN' });
+  }
+});
+
+const INITIALIZE_CONFIRM_PHRASE = 'INITIALIZE';
+
+router.post('/initialize', requireRole('owner'), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
+  if (req.body?.confirmation_phrase !== INITIALIZE_CONFIRM_PHRASE) {
+    return res.status(400).json({ error: `Type "${INITIALIZE_CONFIRM_PHRASE}" to confirm` });
+  }
+  try {
+    const { backupPath } = await resetDatabaseWithBackup(getHttpRequestSignal(req));
+    clearUserAuthCache();
+    clearInMemoryRevokedTokens();
+    clearJWTSecretCache();
+    res.json({ success: true, backupPath });
+  } catch (error: any) {
+    console.error('[DB Tools] initialize error:', error);
+    res.status(500).json({ error: 'Initialize failed' });
+  }
+}));
+
+export const databaseToolsRoutes = router;

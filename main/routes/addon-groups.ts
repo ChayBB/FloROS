@@ -1,0 +1,408 @@
+import { Router, Request, Response } from 'express';
+import { getDatabase, now, withTxn, getSettingValue } from '../db';
+import { randomUUID } from 'crypto';
+import { requireRole } from '../middleware/security';
+import { getActiveCountryPack, hasConfiguredTaxCategories } from '../services/tax';
+
+const VALID_TAX_BEHAVIORS = ['country_default', 'inclusive', 'exclusive', 'exempt'];
+
+const router = Router();
+
+function hasOwn(body: Record<string, unknown>, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(body, field);
+}
+
+function toBoolean(value: unknown): boolean {
+  return value === true || value === 1;
+}
+
+function serializeAddon(addon: any): any {
+  if (!addon) return addon;
+  return {
+    ...addon,
+    is_active: toBoolean(addon.is_active),
+    inherit_parent_tax_category: toBoolean(addon.inherit_parent_tax_category),
+  };
+}
+
+function serializeAddonGroup(group: any): any {
+  if (!group) return group;
+  return {
+    ...group,
+    is_required: toBoolean(group.is_required),
+    allow_multiple_quantities: toBoolean(group.allow_multiple_quantities),
+    is_active: toBoolean(group.is_active),
+    addons: Array.isArray(group.addons) ? group.addons.map(serializeAddon) : group.addons,
+  };
+}
+
+function invalidTaxBehavior(addons: any[] | undefined): string | null {
+  if (!Array.isArray(addons)) return null;
+  for (const addon of addons) {
+    if (addon?.tax_behavior !== undefined && addon.tax_behavior !== null && !VALID_TAX_BEHAVIORS.includes(addon.tax_behavior)) {
+      return `tax_behavior must be one of: ${VALID_TAX_BEHAVIORS.join(', ')}`;
+    }
+  }
+  return null;
+}
+
+function invalidTaxCategory(addons: any[] | undefined): string | null {
+  if (!Array.isArray(addons)) return null;
+  const country = getSettingValue('country') || 'IN';
+  const businessType = getSettingValue('business_type') || 'restaurant';
+  const pack = getActiveCountryPack(country);
+  for (const addon of addons) {
+    const categoryId = addon?.tax_category_id;
+    if (categoryId === null || categoryId === undefined || categoryId === '') continue;
+    if (typeof categoryId !== 'string') return 'tax_category_id must be a string or null';
+    if (!hasConfiguredTaxCategories(pack, businessType)) {
+      return `No configured tax categories are available for country ${country} and business type ${businessType}`;
+    }
+    if (!pack.categories.some((category) => category.id === categoryId)) {
+      return `Unknown tax_category_id "${categoryId}" for country ${country}`;
+    }
+  }
+  return null;
+}
+
+function validateSelectionBounds(minSelection: number, maxSelection: number, activeAddonCount: number): Record<string, string[]> | null {
+  if (minSelection > maxSelection) {
+    return { min_selection: ['Minimum selection cannot exceed maximum selection'] };
+  }
+  if (minSelection > activeAddonCount) {
+    return { min_selection: [`Minimum selection cannot exceed the number of active add-ons (${activeAddonCount})`] };
+  }
+  return null;
+}
+
+// Guards against deactivating/deleting the last addon(s) that a group's min_selection depends on.
+function wouldBreakMinSelection(db: ReturnType<typeof getDatabase>, groupId: string, excludeAddonId: string): Record<string, string[]> | null {
+  const group = db.prepare('SELECT * FROM addon_groups WHERE id = ?').get(groupId) as { min_selection: number } | undefined;
+  if (!group) return null;
+
+  const remaining = (db.prepare(
+    'SELECT COUNT(*) as count FROM addons WHERE addon_group_id = ? AND is_active = 1 AND id != ?'
+  ).get(groupId, excludeAddonId) as { count: number }).count;
+
+  if (remaining < group.min_selection) {
+    return { min_selection: [`Cannot remove this addon — only ${remaining} would remain active, below the group's minimum selection of ${group.min_selection}. Lower the minimum selection first.`] };
+  }
+  return null;
+}
+
+router.get('/', (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const groups = db.prepare('SELECT * FROM addon_groups WHERE is_active = 1 ORDER BY sort_order, name').all();
+
+    const groupsWithAddons = groups.map((group: any) => {
+      const addons = db.prepare('SELECT * FROM addons WHERE addon_group_id = ? AND is_active = 1 ORDER BY sort_order, name').all(group.id);
+      return serializeAddonGroup({ ...group, addons });
+    });
+
+    res.json({ addon_groups: groupsWithAddons });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.get('/:id', (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const group = db.prepare('SELECT * FROM addon_groups WHERE id = ?').get(req.params.id);
+    if (!group) {
+      return res.status(404).json({ error: 'Addon group not found' });
+    }
+
+    const addons = db.prepare('SELECT * FROM addons WHERE addon_group_id = ? ORDER BY sort_order, name').all(req.params.id);
+    res.json({ addon_group: serializeAddonGroup({ ...(group as any), addons }) });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const { name, description, is_required, min_selection, max_selection, allow_multiple_quantities, sort_order, addons } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: 'Name is required' });
+    }
+
+    const min = min_selection ?? 0;
+    const max = max_selection ?? 1;
+    const activeAddonCount = Array.isArray(addons) ? addons.filter((a: any) => a.is_active !== false).length : 0;
+    const boundsError = validateSelectionBounds(min, max, activeAddonCount);
+    if (boundsError) {
+      return res.status(400).json({ errors: boundsError });
+    }
+    const taxBehaviorError = invalidTaxBehavior(addons);
+    if (taxBehaviorError) {
+      return res.status(400).json({ error: taxBehaviorError });
+    }
+    const taxCategoryError = invalidTaxCategory(addons);
+    if (taxCategoryError) {
+      return res.status(400).json({ error: taxCategoryError });
+    }
+
+    const db = getDatabase();
+    const groupId = randomUUID();
+    const { group, groupAddons } = withTxn(() => {
+      db.prepare(`
+        INSERT INTO addon_groups (id, name, description, is_required, min_selection, max_selection, allow_multiple_quantities, sort_order, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        groupId, name, description || null, is_required ? 1 : 0, min_selection || 0, max_selection || 1, allow_multiple_quantities ? 1 : 0, sort_order || 0, now(), now()
+      );
+
+      if (addons && addons.length > 0) {
+        const insertAddon = db.prepare(`
+          INSERT INTO addons (id, addon_group_id, name, price, tax_category_id, tax_behavior, inherit_parent_tax_category, sort_order, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        addons.forEach((addon: any, index: number) => {
+          insertAddon.run(
+            randomUUID(), groupId, addon.name, addon.price || 0,
+            addon.tax_category_id || null, addon.tax_behavior || 'country_default',
+            addon.inherit_parent_tax_category !== false ? 1 : 0,
+            index, now(), now(),
+          );
+        });
+      }
+
+      return {
+        group: db.prepare('SELECT * FROM addon_groups WHERE id = ?').get(groupId),
+        groupAddons: db.prepare('SELECT * FROM addons WHERE addon_group_id = ?').all(groupId),
+      };
+    });
+
+    res.status(201).json({ addon_group: serializeAddonGroup(Object.assign({}, group, { addons: groupAddons })) });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const group = db.prepare('SELECT * FROM addon_groups WHERE id = ?').get(req.params.id);
+    if (!group) {
+      return res.status(404).json({ error: 'Addon group not found' });
+    }
+
+    const { name, description, is_required, min_selection, max_selection, allow_multiple_quantities, sort_order, is_active, addons } = req.body;
+
+    const effectiveMin = min_selection ?? (group as any).min_selection;
+    const effectiveMax = max_selection ?? (group as any).max_selection;
+    const activeAddonCount = Array.isArray(addons)
+      ? addons.filter((a: any) => a.is_active !== false).length
+      : (db.prepare('SELECT COUNT(*) as count FROM addons WHERE addon_group_id = ? AND is_active = 1').get(req.params.id) as { count: number }).count;
+    const boundsError = validateSelectionBounds(effectiveMin, effectiveMax, activeAddonCount);
+    if (boundsError) {
+      return res.status(400).json({ errors: boundsError });
+    }
+    const taxBehaviorError = invalidTaxBehavior(addons);
+    if (taxBehaviorError) {
+      return res.status(400).json({ error: taxBehaviorError });
+    }
+    const taxCategoryError = invalidTaxCategory(addons);
+    if (taxCategoryError) {
+      return res.status(400).json({ error: taxCategoryError });
+    }
+
+    const reqName = name ?? null;
+    const hasDescription = hasOwn(req.body, 'description');
+    const reqDesc = description === undefined || description === null || description === '' ? null : description;
+    const reqReq = is_required === undefined ? null : (is_required ? 1 : 0);
+    const reqMin = min_selection ?? null;
+    const reqMax = max_selection ?? null;
+    const reqAllowMult = allow_multiple_quantities === undefined ? null : (allow_multiple_quantities ? 1 : 0);
+    const reqSort = sort_order ?? null;
+    const reqActive = is_active === undefined ? null : (is_active ? 1 : 0);
+
+    const { updated, updatedAddons } = withTxn(() => {
+      db.prepare(`
+        UPDATE addon_groups SET name = COALESCE(?, name), description = CASE WHEN ? = 1 THEN ? ELSE description END,
+          is_required = COALESCE(?, is_required), min_selection = COALESCE(?, min_selection),
+          max_selection = COALESCE(?, max_selection), allow_multiple_quantities = COALESCE(?, allow_multiple_quantities),
+          sort_order = COALESCE(?, sort_order), is_active = COALESCE(?, is_active), updated_at = ?
+        WHERE id = ?
+      `).run(reqName, hasDescription ? 1 : 0, reqDesc, reqReq, reqMin, reqMax, reqAllowMult, reqSort, reqActive, now(), req.params.id);
+
+      if (Array.isArray(addons)) {
+        db.prepare('DELETE FROM addons WHERE addon_group_id = ?').run(req.params.id);
+        const insertAddon = db.prepare(`
+          INSERT INTO addons (id, addon_group_id, name, price, tax_category_id, tax_behavior, inherit_parent_tax_category, is_active, sort_order, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+        addons.forEach((addon: any, index: number) => {
+          insertAddon.run(
+            randomUUID(), req.params.id, addon.name, addon.price ?? 0,
+            addon.tax_category_id || null, addon.tax_behavior || 'country_default',
+            addon.inherit_parent_tax_category !== false ? 1 : 0,
+            addon.is_active !== false ? 1 : 0, index, now(), now(),
+          );
+        });
+      }
+
+      return {
+        updated: db.prepare('SELECT * FROM addon_groups WHERE id = ?').get(req.params.id),
+        updatedAddons: db.prepare('SELECT * FROM addons WHERE addon_group_id = ?').all(req.params.id),
+      };
+    });
+
+    res.json({ addon_group: serializeAddonGroup(Object.assign({}, updated, { addons: updatedAddons })) });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.delete('/:id', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const group = db.prepare('SELECT * FROM addon_groups WHERE id = ?').get(req.params.id);
+    if (!group) {
+      return res.status(404).json({ error: 'Addon group not found' });
+    }
+
+    // Soft delete — order_items already snapshot chosen addons as JSON at order
+    // time, but keeping the row lets historical orders/product editors resolve
+    // addon_group_id without a dangling reference.
+    db.prepare('UPDATE addon_groups SET is_active = 0, updated_at = ? WHERE id = ?').run(now(), req.params.id);
+    res.json({ message: 'Addon group deleted' });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Addon management within a group
+router.post('/:groupId/addons', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const { name, price, tax_category_id, tax_behavior, inherit_parent_tax_category, is_active, sort_order } = req.body;
+
+    if (!name || price === undefined) {
+      return res.status(400).json({ error: 'Name and price are required' });
+    }
+    if (tax_behavior !== undefined && tax_behavior !== null && !VALID_TAX_BEHAVIORS.includes(tax_behavior)) {
+      return res.status(400).json({ error: `tax_behavior must be one of: ${VALID_TAX_BEHAVIORS.join(', ')}` });
+    }
+    const taxCategoryError = invalidTaxCategory([{ tax_category_id }]);
+    if (taxCategoryError) {
+      return res.status(400).json({ error: taxCategoryError });
+    }
+
+    const db = getDatabase();
+    const group = db.prepare('SELECT * FROM addon_groups WHERE id = ?').get(req.params.groupId);
+    if (!group) {
+      return res.status(404).json({ error: 'Addon group not found' });
+    }
+
+    const addonId = randomUUID();
+    db.prepare(`
+      INSERT INTO addons (id, addon_group_id, name, price, tax_category_id, tax_behavior, inherit_parent_tax_category, is_active, sort_order, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      addonId, req.params.groupId, name, price,
+      tax_category_id || null, tax_behavior || 'country_default', inherit_parent_tax_category !== false ? 1 : 0,
+      is_active !== false ? 1 : 0, sort_order || 0, now(), now(),
+    );
+
+    const addon = db.prepare('SELECT * FROM addons WHERE id = ?').get(addonId);
+    res.status(201).json({ addon: serializeAddon(addon) });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.put('/:groupId/addons/:addonId', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const { name, price, tax_category_id, tax_behavior, inherit_parent_tax_category, is_active, sort_order } = req.body;
+
+    if (tax_behavior !== undefined && tax_behavior !== null && !VALID_TAX_BEHAVIORS.includes(tax_behavior)) {
+      return res.status(400).json({ error: `tax_behavior must be one of: ${VALID_TAX_BEHAVIORS.join(', ')}` });
+    }
+    const taxCategoryError = invalidTaxCategory([{ tax_category_id }]);
+    if (taxCategoryError) {
+      return res.status(400).json({ error: taxCategoryError });
+    }
+
+    const db = getDatabase();
+    const addon = db.prepare('SELECT * FROM addons WHERE id = ? AND addon_group_id = ?').get(req.params.addonId, req.params.groupId) as { is_active: number } | undefined;
+    if (!addon) {
+      return res.status(404).json({ error: 'Addon not found' });
+    }
+
+    const hasTaxCategoryId = 'tax_category_id' in req.body;
+    const updatedAtomically = withTxn(() => {
+      const current = db.prepare('SELECT is_active FROM addons WHERE id = ? AND addon_group_id = ?')
+        .get(req.params.addonId, req.params.groupId) as { is_active: number } | undefined;
+      if (!current) return false;
+      if (is_active === false && current.is_active) {
+        const boundsError = wouldBreakMinSelection(db, req.params.groupId as string, req.params.addonId as string);
+        if (boundsError) return boundsError;
+      }
+
+      db.prepare(`
+        UPDATE addons SET name = COALESCE(?, name), price = COALESCE(?, price),
+          tax_category_id = CASE WHEN ? = 1 THEN ? ELSE tax_category_id END,
+          tax_behavior = COALESCE(?, tax_behavior),
+          inherit_parent_tax_category = COALESCE(?, inherit_parent_tax_category),
+          is_active = COALESCE(?, is_active), sort_order = COALESCE(?, sort_order)
+        WHERE id = ?
+      `).run(
+        name, price, hasTaxCategoryId ? 1 : 0, tax_category_id, tax_behavior,
+        inherit_parent_tax_category === undefined ? null : (inherit_parent_tax_category ? 1 : 0),
+        is_active, sort_order, req.params.addonId,
+      );
+      return true;
+    });
+    if (updatedAtomically !== true) {
+      if (updatedAtomically === false) return res.status(404).json({ error: 'Addon not found' });
+      return res.status(400).json({ errors: updatedAtomically });
+    }
+
+    const updated = db.prepare('SELECT * FROM addons WHERE id = ?').get(req.params.addonId);
+    res.json({ addon: serializeAddon(updated) });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.delete('/:groupId/addons/:addonId', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const addon = db.prepare('SELECT * FROM addons WHERE id = ? AND addon_group_id = ?').get(req.params.addonId, req.params.groupId) as { is_active: number } | undefined;
+    if (!addon) {
+      return res.status(404).json({ error: 'Addon not found' });
+    }
+
+    const deletedAtomically = withTxn(() => {
+      const current = db.prepare('SELECT is_active FROM addons WHERE id = ? AND addon_group_id = ?')
+        .get(req.params.addonId, req.params.groupId) as { is_active: number } | undefined;
+      if (!current) return false;
+      if (current.is_active) {
+        const boundsError = wouldBreakMinSelection(db, req.params.groupId as string, req.params.addonId as string);
+        if (boundsError) return boundsError;
+      }
+      db.prepare('UPDATE addons SET is_active = 0, updated_at = ? WHERE id = ?').run(now(), req.params.addonId);
+      return true;
+    });
+    if (deletedAtomically !== true) {
+      if (deletedAtomically === false) return res.status(404).json({ error: 'Addon not found' });
+      return res.status(400).json({ errors: deletedAtomically });
+    }
+    res.json({ message: 'Addon deleted' });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+export const addonGroupRoutes = router;

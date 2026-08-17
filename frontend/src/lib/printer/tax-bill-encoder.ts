@@ -1,0 +1,266 @@
+/**
+ * tax-bill-encoder.ts
+ *
+ * Detailed tax billing receipt encoder for ESC/POS thermal printers.
+ * Supports both 58mm (2.5") and 80mm (3.5") paper widths.
+ * Includes: tax registration number, HSN/reference codes, and item tax details.
+ */
+
+import ReceiptPrinterEncoder from '@point-of-sale/receipt-printer-encoder';
+import type { Bill, Tenant } from '@/lib/types';
+import { normalizeCurrencyToAscii, padCurrencyPrefix } from './unicode';
+import { getCountryByCode, getCurrencySymbol } from '@/lib/countries';
+import { formatDate } from './format-date';
+import { formatTaxComponentLabel, resolveTaxComponents } from './tax-components';
+import { safePrinterText, type PrintWarning } from './warnings';
+import { RECEIPT_BRANDING_NAME, RECEIPT_BRANDING_URL } from './branding';
+
+export interface TaxBillOptions {
+  /** 58 mm (2.5", 42 chars) or 80 mm (3.5", 48 chars). Default: 58 */
+  paperWidth?: 58 | 80;
+  /** Show "Thank you" footer. Default: true */
+  showFooter?: boolean;
+  /** Business tax registration number */
+  taxRegistrationNumber?: string;
+  /** Business address */
+  address?: string;
+  /** Business phone */
+  phone?: string;
+  /** Show the restaurant name when available. Default: true */
+  showBusinessName?: boolean;
+  /** Show per-tax-rate breakdown lines. Default: true */
+  showTaxBreakdown?: boolean;
+  /** Show the customer name when available. Default: true */
+  showCustomerName?: boolean;
+  /** Show the customer phone when available. Default: true */
+  showCustomerPhone?: boolean;
+  /** Show the table number when available. Default: true */
+  showTableNumber?: boolean;
+  /** State code for tax calculation */
+  stateCode?: string;
+  /** If false (default), replace ₹/€/£/etc. with ASCII (Rs, EUR, GBP…). */
+  useUnicode?: boolean;
+  /** Hide trailing .00 on printed amounts while keeping non-zero decimals. */
+  trimDecimals?: boolean;
+}
+
+// Must match main/printers/profiles.ts generic-escpos-58/80 fontAColumns.
+const CHARS: Record<58 | 80, number> = { 58: 42, 80: 48 };
+
+function printPoweredByFooter(enc: ReceiptPrinterEncoder): void {
+  enc
+    .align('center')
+    .size('small')
+    .text(RECEIPT_BRANDING_NAME)
+    .newline()
+    .text(RECEIPT_BRANDING_URL)
+    .newline()
+    .size('normal')
+    .align('left');
+}
+
+/**
+ * Mask phone number for receipt display — shows only last 4 digits.
+ */
+function maskPhoneOnReceipt(phone: string): string {
+  if (!phone || phone.length < 4) return phone;
+  return 'x'.repeat(phone.length - 4) + phone.slice(-4);
+}
+
+/**
+ * Build a detailed tax bill byte array from a Bill object.
+ */
+export function buildTaxBillBytes(
+  bill: Bill,
+  tenant: Pick<Tenant, 'business_name' | 'currency' | 'country'>,
+  opts: TaxBillOptions = {},
+  warnings?: PrintWarning[]
+): Uint8Array {
+  const {
+    paperWidth = 58,
+    showFooter = true,
+    taxRegistrationNumber,
+    address,
+    phone,
+    showBusinessName = true,
+    showTaxBreakdown = true,
+    showCustomerName = true,
+    showCustomerPhone = true,
+    showTableNumber = true,
+    useUnicode = false,
+    trimDecimals = false,
+  } = opts;
+  const cols = CHARS[paperWidth];
+  const rawCurrency = getCurrencySymbol(tenant.currency ?? 'INR', getCountryByCode(tenant.country ?? 'IN')?.locale);
+  const currency = padCurrencyPrefix(useUnicode ? rawCurrency : normalizeCurrencyToAscii(rawCurrency));
+  const locale = getCountryByCode(tenant.country ?? 'IN')?.locale ?? 'en-US';
+  const taxIdLabel = getCountryByCode(tenant.country ?? 'IN')?.taxIdLabel || 'Tax ID';
+  const order = bill.order;
+  const taxComponents = resolveTaxComponents(bill);
+  const hasTax = Number(bill.tax_amount) !== 0
+    || taxComponents.some((component) => Number(component.amount) !== 0);
+
+  const enc = new ReceiptPrinterEncoder({ columns: cols });
+
+  // ── Header ────────────────────────────────────────────────────────────────
+  enc.initialize().align('center');
+  if (showBusinessName && tenant.business_name) {
+    enc.bold(true).width(2).height(2);
+    safePrinterText(enc, truncate(tenant.business_name, 16), warnings, true);
+    enc.width(1).height(1);
+    enc.bold(false).newline();
+  }
+
+  if (address) {
+    safePrinterText(enc, truncate(address, cols), warnings).newline();
+  }
+  if (phone) {
+    safePrinterText(enc, `Ph: ${phone}`, warnings).newline();
+  }
+  if (taxRegistrationNumber) {
+    safePrinterText(enc, `${taxIdLabel}: ${taxRegistrationNumber}`, warnings).newline();
+  }
+
+  enc.newline();
+
+  // ── Bill Details ─────────────────────────────────────────────────────────
+  enc.align('left');
+  enc.text(`Bill #: ${bill.bill_number}`).newline();
+  enc.text(`Date: ${formatDate(bill.order?.created_at, locale)}`).newline();
+
+  if (showTableNumber && order?.table?.name) {
+    safePrinterText(enc, `Table: ${order.table.name}`, warnings).newline();
+  }
+  if (showCustomerName && order?.customer?.name) {
+    safePrinterText(enc, `Customer: ${order.customer.name}`, warnings).newline();
+  }
+  if (showCustomerPhone && order?.customer?.phone) {
+    enc.text(`Customer No: ${maskPhoneOnReceipt(order.customer.phone)}`).newline();
+  }
+
+  enc.rule({ style: 'single' });
+
+  // ── Line Items with HSN ─────────────────────────────────────────────────
+  enc.text(padRow('Item', 'Qty Rate Amount', cols)).newline();
+  enc.rule({ style: 'single' });
+
+  const items = order?.items ?? [];
+  for (const item of items) {
+    const line = `${item.product_name}`;
+
+    safePrinterText(enc, padRow(line, formatAmount(item.total, currency, locale, trimDecimals), cols), warnings).newline();
+
+    // Show HSN if available
+    const hsnCode = 'hsn_code' in item ? (item as { hsn_code?: string }).hsn_code : undefined;
+    if (hsnCode) {
+      enc.size('small').text(`    HSN: ${hsnCode}`).size('normal').newline();
+    }
+
+    // Addons
+    if (item.addons && item.addons.length > 0) {
+      for (const addon of item.addons) {
+        const qty = ('quantity' in addon && typeof addon.quantity === 'number') ? addon.quantity : 1;
+        const addonLine = `   + ${addon.name}${qty > 1 ? ` x${qty}` : ''}`;
+        const addonPrice = addon.price && Number(addon.price) > 0
+          ? formatAmount(Number(addon.price) * qty * item.quantity, currency, locale, trimDecimals)
+          : '';
+        safePrinterText(enc, padRow(addonLine, addonPrice, cols), warnings).newline();
+      }
+    }
+  }
+
+  enc.rule({ style: 'single' });
+
+  // ── Tax Breakdown ───────────────────────────────────────────────────────
+  if (showTaxBreakdown && taxComponents.length > 0) {
+    enc.text('Tax Details:').newline();
+    for (const component of taxComponents) {
+      enc.text(
+        padRow(formatTaxComponentLabel(component), formatAmount(component.amount, currency, locale, trimDecimals), cols),
+      ).newline();
+    }
+  }
+
+  // ── Totals ───────────────────────────────────────────────────────────────
+  enc.rule({ style: 'single' });
+
+  const totals: [string, string][] = [
+    ['Subtotal', formatAmount(bill.subtotal, currency, locale, trimDecimals)],
+  ];
+
+  if (Number(bill.discount_amount) > 0) {
+    totals.push(['Discount', `-${formatAmount(bill.discount_amount, currency, locale, trimDecimals)}`]);
+  }
+
+  if (Number(bill.tax_amount) > 0) {
+    totals.push(['Total Tax', formatAmount(bill.tax_amount, currency, locale, trimDecimals)]);
+  }
+
+  if (Number(bill.service_charge) > 0) {
+    totals.push(['Service Chg', formatAmount(bill.service_charge, currency, locale, trimDecimals)]);
+  }
+
+  if (Number(bill.delivery_charge) > 0) {
+    totals.push(['Delivery', formatAmount(bill.delivery_charge, currency, locale, trimDecimals)]);
+  }
+
+  for (const [label, value] of totals) {
+    enc.text(padRow(label, value, cols)).newline();
+  }
+
+  enc.rule({ style: 'double' });
+  enc.bold(true).width(2).text(padRow('TOTAL', formatAmount(bill.total, currency, locale, trimDecimals), cols)).width(1);
+  enc.bold(false).newline();
+
+  // ── Payment Details ───────────────────────────────────────────────────────
+  if (bill.payment_details && bill.payment_details.length > 0) {
+    enc.newline();
+    enc.text('Payments:').newline();
+    for (const p of bill.payment_details) {
+      enc.text(padRow(capitalize(p.method), formatAmount(p.amount, currency, locale, trimDecimals), cols)).newline();
+    }
+  }
+
+  // ── Footer ───────────────────────────────────────────────────────────────
+  if (showFooter) {
+    enc.newline().align('center');
+    enc.text('Thank you for your visit!').newline();
+    enc.text('Please come again').newline();
+    if (hasTax) {
+      enc.text('Tax included where applicable').newline();
+    }
+  }
+  printPoweredByFooter(enc);
+
+  enc.newline().newline().newline().cut();
+
+  return enc.encode();
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function padRow(left: string, right: string, cols: number): string {
+  const safeRight = right.length > cols ? right.slice(-cols) : right;
+  const leftWidth = Math.max(0, cols - safeRight.length - 1);
+  return left.slice(0, leftWidth) + (leftWidth > 0 ? ' ' : '') + safeRight;
+}
+
+function truncate(str: string, max: number): string {
+  return str.length > max ? str.slice(0, max - 1) + '…' : str;
+}
+
+function formatAmount(value: number | string, currency: string, locale: string, trimDecimals: boolean = false): string {
+  const amount = Number(value);
+  const numeric = Number.isFinite(amount) ? amount : 0;
+  const hasDecimals = Math.round(numeric * 100) % 100 !== 0;
+  return `${currency}${numeric.toLocaleString(locale, {
+    minimumFractionDigits: trimDecimals && !hasDecimals ? 0 : 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function capitalize(str: string): string {
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
