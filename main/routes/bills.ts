@@ -15,6 +15,7 @@ import {
 } from '../db';
 import { asyncHandler } from '../middleware/async-handler';
 import { notifyKdsUpdate, notifyOrderUpdated } from '../services/kds';
+import { closeSessionIfSettled } from '../services/table-session';
 import { printReceipt } from '../services/receipt';
 import { requireRole } from '../middleware/security';
 import {
@@ -1895,8 +1896,11 @@ function applyPaymentBatch(
     const orderFullyPaid = !unpaidSibling;
     if (orderFullyPaid) {
       db.prepare("UPDATE orders SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?").run(changedAt, changedAt, bill.order_id);
-      const order = db.prepare('SELECT table_id FROM orders WHERE id = ?').get(bill.order_id) as any;
+      const order = db.prepare('SELECT table_id, table_session_id FROM orders WHERE id = ?').get(bill.order_id) as any;
       if (order?.table_id) db.prepare("UPDATE tables SET status = 'available', updated_at = ? WHERE id = ?").run(changedAt, order.table_id);
+      // Close the shared table session once every order in it is settled.
+      // Non-throwing — a session hiccup must never abort a completed payment.
+      if (order?.table_session_id) closeSessionIfSettled(order.table_session_id);
     }
     const cashback = calculateCashback(db, bill, effectiveCustomerId);
     const alreadyCredited = db.prepare(`SELECT id FROM loyalty_ledger WHERE bill_id = ? AND type = 'credit'`).get(bill.id);

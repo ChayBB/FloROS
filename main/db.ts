@@ -3860,6 +3860,94 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       insertSettingIfMissing('invoice_financial_year_start_day', '1');
     },
   },
+  {
+    version: 69,
+    name: 'add_table_sessions_and_order_provenance',
+    up: () => {
+      // Table Session Engine: one open dining session per table that every
+      // ordering channel (cloud QR, local QR, staff-assisted, POS) joins, so
+      // billing and kitchen routing are written once.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS table_sessions (
+          id TEXT PRIMARY KEY,
+          session_no TEXT NOT NULL,
+          table_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'OPEN',
+          opened_by_actor TEXT NOT NULL DEFAULT 'STAFF',
+          origin_device_id TEXT,
+          opened_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          closed_at TEXT
+        );
+        -- At most one ACTIVE session per table (OPEN or LOCKED); only CLOSED frees it.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_table_sessions_one_active
+          ON table_sessions (table_id) WHERE status IN ('OPEN', 'LOCKED');
+        CREATE TABLE IF NOT EXISTS table_session_members (
+          id TEXT PRIMARY KEY,
+          table_session_id TEXT NOT NULL,
+          member_type TEXT NOT NULL,
+          guest_token TEXT,
+          staff_id TEXT,
+          joined_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          left_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_tsm_session
+          ON table_session_members (table_session_id);
+      `);
+      const orderCols = getColumns(db, 'orders');
+      if (!orderCols.includes('table_session_id')) db.exec(`ALTER TABLE orders ADD COLUMN table_session_id TEXT`);
+      if (!orderCols.includes('source')) db.exec(`ALTER TABLE orders ADD COLUMN source TEXT`);
+      if (!orderCols.includes('actor_type')) db.exec(`ALTER TABLE orders ADD COLUMN actor_type TEXT`);
+      if (!orderCols.includes('created_by_staff_id')) db.exec(`ALTER TABLE orders ADD COLUMN created_by_staff_id TEXT`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_orders_table_session ON orders (table_session_id)`);
+    },
+  },
+  {
+    version: 70,
+    name: 'add_qr_guest_sessions',
+    up: () => {
+      // Local QR Gateway: a guest scan mints an opaque token bound to a table's
+      // active dining session, so the guest can read the menu and order over the
+      // shop LAN without staff or an account.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS qr_guest_sessions (
+          token TEXT PRIMARY KEY,
+          table_id TEXT NOT NULL,
+          table_session_id TEXT NOT NULL,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_qr_guest_sessions_session
+          ON qr_guest_sessions (table_session_id);
+      `);
+    },
+  },
+  {
+    version: 71,
+    name: 'add_edge_devices_and_sync_sequence',
+    up: () => {
+      // Edge Sync Protocol (this node is the Branch Edge). edge_devices is the
+      // local device registry; the outbox gains a monotonic per-edge sequence.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS edge_devices (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          label TEXT,
+          status TEXT NOT NULL DEFAULT 'ACTIVE',
+          last_seen_at TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      const outboxCols = getColumns(db, 'cloud_sync_outbox');
+      if (outboxCols.length && !outboxCols.includes('event_seq')) {
+        db.exec(`ALTER TABLE cloud_sync_outbox ADD COLUMN event_seq INTEGER`);
+      }
+      db.prepare(
+        `INSERT OR IGNORE INTO sequences (name, date, current_value) VALUES ('edge_event', 'ALL', 0)`
+      ).run();
+    },
+  },
 ];
 
 function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void {
@@ -4639,7 +4727,7 @@ export function generateShortId(table: string, length = 6): string {
 }
 
 /** Atomically get the next sequence value for a given name and date. */
-function getNextSequence(name: string, date: string): number {
+export function getNextSequence(name: string, date: string): number {
   return db.transaction(() => {
     // Try to update existing row
     const updated = db.prepare(`

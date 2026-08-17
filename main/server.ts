@@ -40,6 +40,9 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
   if (req.path.startsWith('/api/auth')) { next(); return; }
   // Allow unauthenticated GET requests for product images (so <img> tags work)
   if (req.path.startsWith('/api/products/') && req.path.endsWith('/image') && req.method === 'GET') { next(); return; }
+  // Local QR Gateway — guests order over the shop LAN without an account. These
+  // routes authorise per opaque guest token; prices are always set server-side.
+  if (req.path.startsWith('/api/edge/')) { next(); return; }
 
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {

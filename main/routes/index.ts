@@ -8,6 +8,9 @@ import { orderRoutes } from './orders';
 import { orderItemRoutes } from './order-items';
 import { billRoutes, syncUnpaidBillsForOrder } from './bills';
 import { tableRoutes } from './tables';
+import { tableSessionRoutes } from './table-sessions';
+import { edgeQrRoutes } from './edge-qr';
+import { edgeAdminRoutes } from './edge-admin';
 import { kitchenStationRoutes } from './kitchen-stations';
 import { kitchenRoutes } from './kitchen';
 import { customerRoutes, parseCustomer, getWalletBalance } from './customers';
@@ -77,6 +80,9 @@ export function registerRoutes(app: Express): void {
   app.use('/api/kitchen', kitchenRoutes);
   app.use('/api/bills', billRoutes);
   app.use('/api/tables', tableRoutes);
+  app.use('/api/table-sessions', tableSessionRoutes);
+  app.use('/api/edge', edgeQrRoutes);   // Local QR Gateway — unauthenticated guest ordering
+  app.use('/api/edge-admin', edgeAdminRoutes);   // authenticated edge observability
   app.use('/api/kitchen-stations', kitchenStationRoutes);
   app.use('/api/customers', customerRoutes);
   app.use('/api/staff', staffRoutes);   // users with POS roles

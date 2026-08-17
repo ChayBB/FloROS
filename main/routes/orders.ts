@@ -1,6 +1,8 @@
 import { createHash } from 'crypto';
 import { Router, Request, Response } from 'express';
 import { getDatabase, generateOrderNumber, now, parseItemJson, parseRowJson, withTxn, verifyPin, getSettingValue, insertOrderItemAddons, attachEffectiveAddons, utcDayBounds, utcTodayDate } from '../db';
+import { buildOrder } from '../services/order-create';
+import { openOrGetSession, joinSession, linkOrderToSession } from '../services/table-session';
 import {
   calculateConfiguredChargeTaxes,
   calculateItemTax,
@@ -432,157 +434,30 @@ router.post('/', requireRole('owner', 'manager', 'cashier', 'waiter'), (req: Req
           }
         }
       }
-      // Generate order number inside transaction to prevent race conditions
-      const orderNumber = generateOrderNumber();
-
-      // Get settings for tax calculation
-      const settings: Record<string, string> = {};
-      db.prepare('SELECT key, value FROM settings').all().forEach((row: any) => {
-        settings[row.key] = row.value;
+      const built = buildOrder(db, {
+        type, table_id, customer_id, user_id: authenticatedUserId,
+        guest_count, special_instructions, packaging_charge, delivery_charge, items,
       });
+      const orderId = built.orderId;
 
-      const tenantInfo = {
-        country: settings.country || 'IN',
-        business_type: settings.business_type || 'restaurant',
-        state_code: settings.state_code || '',
-        taxes_enabled: settings.taxes_enabled === 'true',
-      };
-      const chargeCategories = getConfiguredChargeTaxCategories(tenantInfo.country);
-      const chargeContext = {
-        packaging_charge: packaging_charge || 0,
-        delivery_charge: delivery_charge || 0,
-        service_charge: 0,
-        packaging_tax_category_id: chargeCategories.packaging?.categoryId || null,
-        delivery_tax_category_id: chargeCategories.delivery?.categoryId || null,
-        service_charge_tax_category_id: chargeCategories.service_charge?.categoryId || null,
-      };
-
-      const orderResult = db.prepare(`
-        INSERT INTO orders (order_number, table_id, customer_id, user_id, type, guest_count, special_instructions,
-          packaging_charge, delivery_charge, packaging_tax_category_id, delivery_tax_category_id,
-          service_charge_tax_category_id, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-      `).run(orderNumber, table_id || null, customer_id || null, authenticatedUserId, type, guest_count || null,
-        special_instructions || null, packaging_charge || 0, delivery_charge || 0,
-        chargeContext.packaging_tax_category_id, chargeContext.delivery_tax_category_id,
-        chargeContext.service_charge_tax_category_id, now(), now());
-
-      const orderId = orderResult.lastInsertRowid;
-
-      let subtotal = 0;
-      let totalTax = 0;
-      let exclusiveTax = 0;
-      const allTaxBreakdowns: any[] = [];
-      const allTaxSnapshots: (string | null)[] = [];
-      const customer = customer_id ? db.prepare('SELECT * FROM customers WHERE id = ?').get(customer_id) as any : null;
-
-      const insertItem = db.prepare(`
-        INSERT INTO order_items (order_id, product_id, product_name, product_sku, unit_price, quantity, inventory_deducted_quantity,
-          subtotal, tax_amount, tax_breakdown, tax_snapshot, tax_type, discount_amount, total, variant_selection,
-          modifier_selection, special_instructions, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-      `);
-
-      for (const item of items) {
-        const product = db.prepare('SELECT * FROM products WHERE id = ?').get(item.product_id) as any;
-        if (!product) {
-          throw new Error(`Product ${item.product_id} not found`);
-        }
-
-        if (product.track_inventory && product.stock_quantity < item.quantity) {
-          throw new Error(`Insufficient stock for ${product.name}`);
-        }
-
-        const unitPrice = parseFloat(product.price);
-        const quantity = item.quantity;
-        // item.discount_amount is intentionally ignored here — discounts are only
-        // applied through the dedicated PATCH discount endpoints, which enforce
-        // discount_mode/max_percentage/max_amount/approval (vuln-0002).
-        const itemDiscount = 0;
-
-        // Validate quantity and price
-        if (!quantity || quantity <= 0 || !Number.isFinite(quantity)) {
-          throw new Error(`Invalid quantity for ${product.name}: must be a positive number`);
-        }
-        if (unitPrice < 0 || !Number.isFinite(unitPrice)) {
-          throw new Error(`Invalid price for ${product.name}: must be a non-negative number`);
-        }
-
-        let itemSubtotal = unitPrice * quantity;
-        if (item.addons && Array.isArray(item.addons)) {
-          for (const addon of item.addons) {
-            if (!addon) continue;
-            if (addon.quantity !== undefined) {
-              if (typeof addon.quantity !== 'number' || !Number.isInteger(addon.quantity) || addon.quantity <= 0) {
-                throw new Error(`Invalid add-on quantity for ${addon.name || 'addon'}: must be a positive integer`);
-              }
-            }
-            const addonQty = addon.quantity || 1;
-            itemSubtotal += (addon.price || 0) * addonQty * quantity;
-          }
-        }
-        itemSubtotal = Math.max(0, itemSubtotal - itemDiscount);
-
-        const taxResult = calculateItemTax(tenantInfo, product, itemSubtotal, customer);
-
-        totalTax += taxResult.tax_amount;
-        if (taxResult.tax_type !== 'inclusive') {
-          exclusiveTax += taxResult.tax_amount;
-        }
-        if (taxResult.tax_breakdown) {
-          allTaxBreakdowns.push(taxResult.tax_breakdown);
-        }
-        const itemTaxSnapshotJson = taxResult.tax_snapshot ? JSON.stringify(taxResult.tax_snapshot) : null;
-        allTaxSnapshots.push(itemTaxSnapshotJson);
-
-        const itemTotal = itemSubtotal + (taxResult.tax_type === 'inclusive' ? 0 : taxResult.tax_amount);
-        subtotal += itemSubtotal;
-
-        const itemCreatedAt = now();
-        const insertItemResult = insertItem.run(
-          orderId, product.id, product.name, product.sku, unitPrice, quantity, product.track_inventory ? quantity : 0,
-          itemSubtotal, taxResult.tax_amount, JSON.stringify(taxResult.tax_breakdown), itemTaxSnapshotJson,
-          taxResult.tax_type, itemDiscount, itemTotal,
-          JSON.stringify(item.variant_selection || null),
-          JSON.stringify(item.modifier_selection || null),
-          item.special_instructions || null, itemCreatedAt, itemCreatedAt
-        );
-        insertOrderItemAddons(db, insertItemResult.lastInsertRowid, item.addons, itemCreatedAt);
-
-        if (product.track_inventory) {
-          db.prepare('UPDATE products SET stock_quantity = stock_quantity - ?, updated_at = ? WHERE id = ?')
-            .run(quantity, now(), product.id);
+      // Dine-in orders join the table's shared session. on_behalf_of_guest marks
+      // staff taking an order for a guest (STAFF_LOCAL) vs a plain terminal
+      // order (POS_LOCAL); both land in the same session.
+      if (type === 'dine_in' && table_id) {
+        const session = openOrGetSession(String(table_id), 'POS');
+        if (session.status === 'OPEN') {
+          joinSession(session.id, { member_type: 'STAFF', staff_id: String(authenticatedUserId) });
+          linkOrderToSession(Number(orderId), session.id, {
+            source: body.on_behalf_of_guest ? 'STAFF_LOCAL' : 'POS_LOCAL',
+            actor_type: 'STAFF',
+            created_by_staff_id: String(authenticatedUserId),
+          });
         }
       }
 
-      const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, chargeContext, customer);
-      const taxRollup = combineItemAndChargeTaxes({
-        itemTaxAmount: totalTax,
-        itemExclusiveTaxAmount: exclusiveTax,
-        itemBreakdowns: allTaxBreakdowns,
-        itemSnapshots: allTaxSnapshots,
-        itemTaxRatio: 1,
-        chargeTaxes,
-      });
-      const preRoundTotal = subtotal + taxRollup.exclusiveTaxAmount
-        + (delivery_charge || 0) + (packaging_charge || 0);
-      const total = Number(preRoundTotal.toFixed(2));
-      const roundOff = 0;
-
-      db.prepare(`
-        UPDATE orders SET subtotal = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, total = ?,
-          round_off = ?, updated_at = ? WHERE id = ?
-      `).run(
-        subtotal, taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns),
-        taxRollup.snapshotJson, total, roundOff, now(), orderId,
-      );
-
-      if (table_id && type === 'dine_in') {
-        db.prepare("UPDATE tables SET status = 'occupied', updated_at = ? WHERE id = ?").run(now(), table_id);
-      }
-
+      // Re-read after the session link so the response carries table_session_id.
       const order = parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId)) as any;
-      const orderItems = attachEffectiveAddons(db, db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId).map(parseItemJson) as any[]);
+      const orderItems = built.orderItems;
       const response = { order: Object.assign({}, order, { items: orderItems }) };
       if (idempotencyKey && requestHash) {
         db.prepare('INSERT INTO order_idempotency (user_id, idempotency_key, request_hash, response_json, created_at) VALUES (?, ?, ?, ?, ?)')
