@@ -1,0 +1,349 @@
+openapi: 3.1.0
+info:
+  title: FloPOS Cloud API — edge sync (v2) + commands
+  version: 2.0.0-draft
+  description: |
+    Server-side contract for the FloAdmin cloud (`https://blue.flopos.com`) that the
+    FloCafe / restaurant-OS **edge** (Branch Edge) talks to. Reverse-engineered from
+    the edge client `main/services/cloud-sync.ts` + `main/services/edge-sync.ts`
+    and a read-only probe (see docs/cloud-api-survey.md).
+
+    Scope of this draft: the **event sink** (`/api/pos/events` v2, extended for the
+    restaurant-OS `table_session` entity) and the **command channel**
+    (`/api/pos/commands` HTTP fallback; the WSS relay `/api/pos/relay` is the
+    primary push path and is documented as a note, not modelled here).
+
+    What is already implemented on the edge and MUST be honoured server-side:
+      - Store-and-forward outbox with per-store monotonic `event_seq`.
+      - An `idempotency_key` inside every restaurant-OS event payload.
+      - Batch delivery (≤ 50 events/request), retried with backoff until 2xx.
+      - Command poll (`GET /api/pos/commands`) + result post
+        (`POST /api/pos/commands/{id}/result`), plus the WSS relay.
+
+servers:
+  - url: https://blue.flopos.com
+
+security:
+  - floSignature: []
+
+tags:
+  - name: onboarding
+  - name: sync
+  - name: commands
+
+paths:
+  /api/pos/register:
+    post:
+      tags: [onboarding]
+      summary: Auto-register a store on first boot (unauthenticated)
+      description: |
+        The only unauthenticated write. Creates the store from its `pos_hash`
+        (sent as `X-Flo-POS-Hash`) and returns a `store_id` + `api_key` used to
+        sign every later request. Idempotent by install: a `pos_hash` already
+        seen returns the same identity rather than duplicating.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/PosHash'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '200':
+          description: Registered (or recognised)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegisterResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/pos/events:
+    post:
+      tags: [sync]
+      summary: Store-and-forward event sink (v2)
+      description: |
+        Accepts a batch of domain events from one store's outbox. **v2 adds the
+        `table_session` entity** (`session.opened` / `session.closed`) alongside
+        the existing `order` events.
+
+        Server rules (the edge already provides everything needed):
+          - **Idempotent** on `(pos_hash, payload.idempotency_key)`. Re-delivery of
+            the same event is a no-op — the edge retries whole batches on any
+            non-2xx, so duplicates are expected and MUST NOT double-apply.
+          - **Ordered** per store by `payload.event_seq` (the cursor). Apply in
+            ascending order; ignore any event at or below the store's stored
+            cursor.
+          - Persist accepted events (suggested table `edge_sync_events`, unique on
+            `(store_id, idempotency_key)`), advance `edge_cursors.last_seq`.
+          - On 2xx the edge marks the whole batch delivered, so a 2xx MUST mean
+            every event in it is durably accepted (or was already applied).
+        Note: `order` payloads are a sanitized order snapshot and do **not**
+        carry `event_seq`/`idempotency_key`; dedupe those on `entity_id` +
+        `event.id`. Only restaurant-OS events (`table_session`, and future
+        `order`/`payment` edge events) carry the seq/key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventBatch' }
+      responses:
+        '200':
+          description: Batch accepted (all events durable or already applied)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventBatchAck' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/pos/heartbeat:
+    post:
+      tags: [sync]
+      summary: Liveness + store rollup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Heartbeat' }
+      responses:
+        '200':
+          description: Ack; may carry a feature flag set the edge applies
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  features: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/pos/commands:
+    get:
+      tags: [commands]
+      summary: Poll queued cloud→edge commands (HTTP fallback for the WSS relay)
+      description: |
+        The WSS relay (`/api/pos/relay`) is the primary push channel; this poll is
+        the fallback the edge uses when the relay is unavailable. Return up to
+        `limit` queued commands for the calling store. Commands remain queued
+        until the edge posts a result (see below).
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 5 }
+      responses:
+        '200':
+          description: Queued commands (possibly empty)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  commands:
+                    type: array
+                    items: { $ref: '#/components/schemas/Command' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/pos/commands/{id}/result:
+    post:
+      tags: [commands]
+      summary: Return a command's execution result
+      description: |
+        Idempotent ack + result. Once received, the command is DELIVERED/ACKED and
+        MUST NOT be returned by the poll again. Re-posting the same result is safe.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CommandResult' }
+      responses:
+        '200': { description: Result recorded }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Unknown command id }
+
+components:
+  securitySchemes:
+    floSignature:
+      type: apiKey
+      in: header
+      name: X-Flo-Signature
+      description: |
+        HMAC request signing. Every signed request carries ALL of these headers
+        (see cloud-sync.ts `buildSignedHeaders`):
+          Authorization:     Bearer <api_key>
+          X-Flo-POS-Hash:    <pos_hash>
+          X-Flo-Timestamp:   <ISO-8601>
+          X-Flo-Nonce:       <uuid>            # reject replays within a window
+          X-Flo-Body-SHA256: <hex sha256(rawBody)>
+          X-Flo-Signature:   sha256=<hex HMAC-SHA256(api_key, signatureBase)>
+        signatureBase = METHOD "\n" path "\n" timestamp "\n" nonce "\n" bodySha256
+        Server MUST verify: signature, body hash matches, timestamp within skew,
+        nonce unseen. `X-Api-Key` is an accepted alternate key transport.
+
+  parameters:
+    PosHash:
+      name: X-Flo-POS-Hash
+      in: header
+      required: true
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing/invalid signature
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Malformed body
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+
+    RegisterRequest:
+      type: object
+      required: [app_version, store_type, business, requested_at]
+      properties:
+        arch: { type: string, example: x64 }
+        app_version: { type: string }
+        store_type: { type: string, enum: [cafe] }
+        business:
+          type: object
+          properties:
+            name: { type: string }
+            contact_name: { type: string }
+            email: { type: string, format: email }
+            phone: { type: string }
+            country: { type: string, example: TH }
+            timezone: { type: string, example: Asia/Bangkok }
+            currency: { type: string, example: THB }
+            address: { type: string }
+        requested_at: { type: string, format: date-time }
+
+    RegisterResponse:
+      type: object
+      required: [store_id, api_key]
+      properties:
+        store_id: { type: string }
+        api_key: { type: string, description: Secret used as the HMAC key for all later requests }
+
+    EventBatch:
+      type: object
+      required: [pos_hash, events, sent_at]
+      properties:
+        pos_hash: { type: string }
+        sent_at: { type: string, format: date-time }
+        events:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/Event' }
+
+    Event:
+      type: object
+      required: [id, type, entity_type, entity_id, payload]
+      properties:
+        id: { type: string, format: uuid, description: Client outbox row id }
+        type:
+          type: string
+          description: Event type
+          examples: [order.created, order.status, session.opened, session.closed]
+        entity_type:
+          type: string
+          enum: [order, table_session, payment, device_status]
+        entity_id: { type: string }
+        payload:
+          oneOf:
+            - $ref: '#/components/schemas/TableSessionEventPayload'
+            - $ref: '#/components/schemas/OrderSnapshot'
+          description: |
+            For `table_session` (and future edge-authored `order`/`payment`
+            events) the payload carries `event_seq` + `idempotency_key`. For the
+            legacy `order` snapshot it does not.
+
+    TableSessionEventPayload:
+      type: object
+      required: [event_seq, idempotency_key]
+      properties:
+        event_seq: { type: integer, description: Monotonic per-store cursor value }
+        idempotency_key:
+          type: string
+          description: '`{entityType}:{entityId}:{eventType}:{seq}` — dedupe key'
+        session_no: { type: string, example: S-1042 }
+        table_id: { type: string }
+        opened_by: { type: string, enum: [GUEST_QR, STAFF, POS] }
+        reason: { type: string, enum: [settled, manual], description: On session.closed }
+
+    OrderSnapshot:
+      type: object
+      description: Sanitized order snapshot (legacy order events). Shape owned by the edge.
+      additionalProperties: true
+      properties:
+        id: { type: integer }
+        order_number: { type: string }
+        table_session_id: { type: string, nullable: true, description: Links the order to its dining session }
+        source: { type: string, enum: [QR_LOCAL, QR_CLOUD, STAFF_LOCAL, POS_LOCAL, POS_CLOUD] }
+        actor_type: { type: string, enum: [GUEST, STAFF, POS] }
+        status: { type: string }
+        total: { type: number }
+
+    EventBatchAck:
+      type: object
+      description: |
+        Minimal ack is sufficient (the edge marks the whole batch delivered on any
+        2xx). Returning the applied cursor lets the edge self-heal gaps.
+      properties:
+        ok: { type: boolean }
+        applied_seq: { type: integer, description: Store's cursor after applying this batch }
+
+    Heartbeat:
+      type: object
+      required: [pos_hash, app_version, sent_at]
+      properties:
+        pos_hash: { type: string }
+        pos_id: { type: string, nullable: true }
+        app_version: { type: string }
+        device_name: { type: string }
+        active_orders: { type: integer }
+        today_sales: { type: number }
+        today_bills: { type: integer }
+        sent_at: { type: string, format: date-time }
+
+    Command:
+      type: object
+      required: [id, cmd]
+      properties:
+        id: { type: string }
+        cmd:
+          type: string
+          description: |
+            Existing (read/query) command types the edge already handles:
+              health.get, orders.live, orders.get,
+              report.sales, report.dashboard, report.hourly, report.items, report.payments
+            Proposed new restaurant-OS command types (cloud→edge control):
+              menu.refresh   — edge re-pulls menu master
+              price.update   — apply price/config change; re-price open unbilled orders
+              device.revoke  — revoke a paired/edge device
+          examples: [orders.live, report.sales, menu.refresh]
+        payload:
+          type: object
+          description: |
+            Envelope `{ version: 1, payload: {...}, correlation_id }` is unwrapped
+            by the edge; send the inner command args here.
+          additionalProperties: true
+        correlation_id: { type: string }
+
+    CommandResult:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok, error] }
+        correlation_id: { type: string }
+        result: { description: Command output on success, type: object, additionalProperties: true }
+        error: { type: string, description: Message on failure }
