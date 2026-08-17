@@ -1686,5 +1686,11 @@
   "pos.splitCheckHint": "Divide items or quantities into separate bills. Payments are still recorded manually.",
   "pos.numberOfChecks": "Number of checks",
   "pos.estimatedItemsTotal": "Estimated items total",
-  "pos.createChecks": "Create checks"
+  "pos.createChecks": "Create checks",
+  "products.wholeMenu": "Whole menu",
+  "products.csvMenuHelp": "One file for the entire menu — categories, products and add-ons together. Best for setting up a new shop fast; import applies them in the right order.",
+  "kds.ttsEnable": "Announce new orders aloud",
+  "kds.ttsDisable": "Mute order announcements",
+  "kds.ttsNewOrder": "New order, {where}. {items}",
+  "kds.ttsTableLabel": "table {table}"
 }

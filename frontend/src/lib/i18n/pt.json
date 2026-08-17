@@ -1686,5 +1686,11 @@
   "pos.splitCheckHint": "Divida itens ou quantidades em contas separadas. Os pagamentos continuam sendo registrados manualmente.",
   "pos.numberOfChecks": "Número de contas",
   "pos.estimatedItemsTotal": "Total estimado dos itens",
-  "pos.createChecks": "Criar contas"
+  "pos.createChecks": "Criar contas",
+  "products.wholeMenu": "Whole menu",
+  "products.csvMenuHelp": "One file for the entire menu — categories, products and add-ons together. Best for setting up a new shop fast; import applies them in the right order.",
+  "kds.ttsEnable": "Announce new orders aloud",
+  "kds.ttsDisable": "Mute order announcements",
+  "kds.ttsNewOrder": "New order, {where}. {items}",
+  "kds.ttsTableLabel": "table {table}"
 }

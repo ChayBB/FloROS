@@ -1,6 +1,6 @@
 'use client';
 
-import { ChefHat, LogOut, Wifi, WifiOff } from 'lucide-react';
+import { ChefHat, LogOut, Wifi, WifiOff, Volume2, VolumeX } from 'lucide-react';
 import type { ConnectionMode } from '@/hooks/useKdsConnection';
 import { useI18n } from '@/hooks/useI18n';
 import type { KdsViewMode } from '@/hooks/useKdsView';
@@ -13,6 +13,8 @@ export interface KdsHeaderProps {
   viewMode: KdsViewMode;
   onChangeView: (mode: KdsViewMode) => void;
   onLogout: () => void;
+  ttsEnabled: boolean;
+  onToggleTts: () => void;
 }
 
 export function KdsHeader({
@@ -23,6 +25,8 @@ export function KdsHeader({
   viewMode,
   onChangeView,
   onLogout,
+  ttsEnabled,
+  onToggleTts,
 }: KdsHeaderProps) {
   const { t } = useI18n();
 
@@ -79,6 +83,15 @@ export function KdsHeader({
               {t('kds.viewKanban')}
             </button>
           </div>
+
+          <button
+            onClick={onToggleTts}
+            aria-pressed={ttsEnabled}
+            className={`min-w-11 min-h-11 p-2 rounded-lg ml-2 ${ttsEnabled ? 'bg-brand/10 text-brand' : 'hover:bg-gray-100 text-gray-500'}`}
+            title={ttsEnabled ? t('kds.ttsDisable') : t('kds.ttsEnable')}
+          >
+            {ttsEnabled ? <Volume2 size={20} /> : <VolumeX size={20} />}
+          </button>
 
           <button
             onClick={onLogout}

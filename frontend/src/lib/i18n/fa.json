@@ -1208,7 +1208,7 @@
   "orders.viewLogs": "دیدن گزارش‌ها",
   "orders.selectedItems": "کالاهای برگزیده",
   "orders.startNewOrderForCustomer": "آغاز سفارش تازه برای این مشتری",
- "pos.addName": "افزودن مشتری تازه ({name})",
+  "pos.addName": "افزودن مشتری تازه ({name})",
   "pos.calculatingTax": "در حال حساب کردن مالیات",
   "pos.confirmPaymentAmount": "تأیید پرداخت · {amount}",
   "pos.creating": "در حال ساخت…",
@@ -1292,7 +1292,8 @@
   "products.addonGroupUpdated": "گروه افزودنی به‌روزرسانی شد",
   "products.addonSelectionRange": "{min} – {max}",
   "products.cashbackLabel": "بازگشت وجه وفاداری",
-  "products.cashbackUsingGlobal": "نرخ سراسری ({rate}٪) از تنظیمات به‌کار گرفته می‌شود. برای این کالا یک مقدار بنویسید تا نرخ آن جدا شود، یا ۰ بگذارید تا شامل آن نشود.","products.cashbackOverrideHint": "این مقدار تنها برای این کالا نرخ سراسری را نادیده می‌گیرد. برای بازگشت به نرخ سراسری، این بخش را خالی کنید.",
+  "products.cashbackUsingGlobal": "نرخ سراسری ({rate}٪) از تنظیمات به‌کار گرفته می‌شود. برای این کالا یک مقدار بنویسید تا نرخ آن جدا شود، یا ۰ بگذارید تا شامل آن نشود.",
+  "products.cashbackOverrideHint": "این مقدار تنها برای این کالا نرخ سراسری را نادیده می‌گیرد. برای بازگشت به نرخ سراسری، این بخش را خالی کنید.",
   "products.cashbackGlobalBadge": "سراسری",
   "products.columnCashback": "بازگشت وجه",
   "products.categoryAndProductsDeleted": "دسته و همه کالاهای آن پاک شدند",
@@ -1685,5 +1686,11 @@
   "pos.splitCheckHint": "کالاها یا شمار آن‌ها را میان صورت‌حساب‌های جدا پخش کنید. پرداخت‌ها همچنان به‌گونه دستی ثبت می‌شوند.",
   "pos.numberOfChecks": "شمار صورت‌حساب‌ها",
   "pos.estimatedItemsTotal": "جمع برآوردی کالاها",
-  "pos.createChecks": "ساخت صورت‌حساب‌ها"
+  "pos.createChecks": "ساخت صورت‌حساب‌ها",
+  "products.wholeMenu": "Whole menu",
+  "products.csvMenuHelp": "One file for the entire menu — categories, products and add-ons together. Best for setting up a new shop fast; import applies them in the right order.",
+  "kds.ttsEnable": "Announce new orders aloud",
+  "kds.ttsDisable": "Mute order announcements",
+  "kds.ttsNewOrder": "New order, {where}. {items}",
+  "kds.ttsTableLabel": "table {table}"
 }

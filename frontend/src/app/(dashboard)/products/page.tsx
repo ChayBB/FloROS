@@ -91,7 +91,7 @@ export default function ProductsPage() {
   const [imageTouched, setImageTouched] = useState(false);
 
   const [showCsvModal, setShowCsvModal] = useState(false);
-  const [csvType, setCsvType] = useState<'categories' | 'products' | 'addons'>('categories');
+  const [csvType, setCsvType] = useState<'categories' | 'products' | 'addons' | 'menu'>('categories');
   const [csvFile, setCsvFile] = useState<File | null>(null);
   const [csvResult, setCsvResult] = useState<Record<string, unknown> | null>(null);
   const [csvUploading, setCsvUploading] = useState(false);
@@ -163,7 +163,7 @@ export default function ProductsPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const openCsvModal = (type: 'categories' | 'products' | 'addons') => {
+  const openCsvModal = (type: 'categories' | 'products' | 'addons' | 'menu') => {
     setCsvType(type);
     setCsvFile(null);
     setCsvResult(null);
@@ -213,7 +213,14 @@ export default function ProductsPage() {
     try {
       const text = await csvFile.text();
       const res = await api.post(`/menu-csv/import/${csvType}`, { csv: text });
-      setCsvResult(res.data);
+      if (csvType === 'menu') {
+        const totals = (res.data?.totals ?? {}) as Record<string, number>;
+        const sections = (res.data?.sections ?? {}) as Record<string, { errors?: string[] }>;
+        const errors = Object.values(sections).flatMap((s) => s?.errors ?? []);
+        setCsvResult({ ...totals, errors });
+      } else {
+        setCsvResult(res.data);
+      }
       fetchData();
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error ?? t('common.importFailed');
@@ -494,6 +501,11 @@ export default function ProductsPage() {
             <Button variant="outline" onClick={() => openCsvModal('products')}>
               <FileSpreadsheet size={16} className="mr-1" /> CSV
             </Button>
+            {isOwnerOrManager && (
+              <Button variant="outline" onClick={() => openCsvModal('menu')}>
+                <FileSpreadsheet size={16} className="mr-1" /> {t('products.wholeMenu')}
+              </Button>
+            )}
             <Button onClick={openCreate}>
               <Plus size={16} className="mr-1" /> {t('products.addProduct')}
             </Button>
@@ -1129,7 +1141,7 @@ export default function ProductsPage() {
           <div className="bg-white rounded-2xl p-6 w-full max-w-lg">
             <div className="flex justify-between items-center mb-5">
               <h2 className="text-lg font-bold">
-                {t('products.csvModalTitle', { type: csvType === 'categories' ? t('products.tabCategories') : csvType === 'products' ? t('products.tabProducts') : t('products.tabAddonGroups') })}
+                {t('products.csvModalTitle', { type: csvType === 'categories' ? t('products.tabCategories') : csvType === 'products' ? t('products.tabProducts') : csvType === 'menu' ? t('products.wholeMenu') : t('products.tabAddonGroups') })}
               </h2>
               <button onClick={() => setShowCsvModal(false)} className="text-gray-400 hover:text-gray-600">
                 <X size={20} />
@@ -1162,6 +1174,9 @@ export default function ProductsPage() {
                 )}
                 {csvType === 'addons' && (
                   <p className="text-xs text-gray-500">{t('products.csvAddonsHelp')}</p>
+                )}
+                {csvType === 'menu' && (
+                  <p className="text-xs text-gray-500">{t('products.csvMenuHelp')}</p>
                 )}
               </div>
 
