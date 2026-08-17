@@ -1692,5 +1692,7 @@
   "kds.ttsEnable": "Announce new orders aloud",
   "kds.ttsDisable": "Mute order announcements",
   "kds.ttsNewOrder": "New order, {where}. {items}",
-  "kds.ttsTableLabel": "table {table}"
+  "kds.ttsTableLabel": "table {table}",
+  "settings.kdsTts": "Announce new orders aloud on the KDS",
+  "settings.kdsTtsHint": "Turns on spoken new-order announcements by default on every kitchen screen. Each screen can still mute or unmute itself with the speaker button."
 }

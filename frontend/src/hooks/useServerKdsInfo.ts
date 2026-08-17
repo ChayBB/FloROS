@@ -7,9 +7,10 @@ export interface ServerKdsInfo {
   language: Language | null;
   country: string | null;
   kdsDefaultView: KdsViewMode | null;
+  ttsEnabled: boolean;
 }
 
-const EMPTY: ServerKdsInfo = { language: null, country: null, kdsDefaultView: null };
+const EMPTY: ServerKdsInfo = { language: null, country: null, kdsDefaultView: null, ttsEnabled: false };
 
 /**
  * Read tenant KDS metadata once on mount. Single source for both views
@@ -29,6 +30,7 @@ export function useServerKdsInfo(baseUrl = ''): ServerKdsInfo {
         language: server.language,
         country: server.country,
         kdsDefaultView: server.kdsDefaultView,
+        ttsEnabled: server.ttsEnabled,
       });
     }).catch(() => {
       if (!cancelled) setInfo(EMPTY);

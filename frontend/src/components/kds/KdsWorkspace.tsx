@@ -10,14 +10,19 @@ import type { UseKdsConnectionResult } from '@/hooks/useKdsConnection';
 
 const TTS_STORAGE_KEY = 'flocafe:kds-tts';
 
-export function KdsWorkspace({ conn, serverDefault }: { conn: UseKdsConnectionResult; serverDefault: 'tabs' | 'kanban' | null }) {
+export function KdsWorkspace({ conn, serverDefault, ttsDefault = false }: { conn: UseKdsConnectionResult; serverDefault: 'tabs' | 'kanban' | null; ttsDefault?: boolean }) {
   const { viewMode, setViewMode } = useKdsView(serverDefault);
 
-  // Spoken announcements are a per-screen preference — a busy line wants sound,
-  // a prep station may not — so it lives in localStorage, not server settings.
-  const [ttsEnabled, setTtsEnabled] = useState<boolean>(
-    () => typeof window !== 'undefined' && (() => { try { return window.localStorage.getItem(TTS_STORAGE_KEY) === '1'; } catch { return false; } })(),
-  );
+  // Announcements have a server-side default (Settings → Kitchen Display, all
+  // screens) that each screen can override locally: an explicit '1'/'0' in
+  // localStorage wins; otherwise the screen follows the server default.
+  const [ttsEnabled, setTtsEnabled] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return ttsDefault;
+    try {
+      const stored = window.localStorage.getItem(TTS_STORAGE_KEY);
+      return stored === null ? ttsDefault : stored === '1';
+    } catch { return ttsDefault; }
+  });
 
   const toggleTts = useCallback(() => {
     setTtsEnabled((prev) => {

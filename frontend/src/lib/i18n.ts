@@ -92,6 +92,7 @@ export type ServerInfo = {
   language: Language | null;
   country: string | null;
   kdsDefaultView: 'tabs' | 'kanban' | null;
+  ttsEnabled: boolean;
 };
 
 /**
@@ -101,7 +102,7 @@ export type ServerInfo = {
  * this must not block first paint of the login screen.
  */
 export async function fetchServerInfo(baseUrl = '', timeoutMs = 1500): Promise<ServerInfo> {
-  const empty: ServerInfo = { language: null, country: null, kdsDefaultView: null };
+  const empty: ServerInfo = { language: null, country: null, kdsDefaultView: null, ttsEnabled: false };
   if (typeof window === 'undefined') return empty;
   try {
     const res = await fetch(`${baseUrl}/api/kds/info`, {
@@ -113,12 +114,14 @@ export async function fetchServerInfo(baseUrl = '', timeoutMs = 1500): Promise<S
       language?: string | null;
       country?: string | null;
       kds_default_view?: string | null;
+      kds_tts_enabled?: boolean;
     };
     return {
       language: data.language === 'fa' ? 'fa' : data.language === 'es' ? 'es' : data.language === 'pt' ? 'pt' : data.language === 'th' ? 'th' : data.language === 'en' ? 'en' : null,
       country: data.country || null,
       kdsDefaultView:
         data.kds_default_view === 'kanban' ? 'kanban' : data.kds_default_view === 'tabs' ? 'tabs' : null,
+      ttsEnabled: data.kds_tts_enabled === true,
     };
   } catch {
     return empty;

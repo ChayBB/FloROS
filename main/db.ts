@@ -3948,6 +3948,15 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       ).run();
     },
   },
+  {
+    version: 72,
+    name: 'seed_kds_tts_enabled',
+    up: () => {
+      // Server-side default for KDS spoken order announcements (off by default).
+      // Each screen can still override locally via its speaker toggle.
+      insertSettingIfMissing('kds_tts_enabled', '0');
+    },
+  },
 ];
 
 function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void {

@@ -164,6 +164,8 @@ function KdsDefaultViewCard() {
   const { t } = useI18n();
   const [view, setView] = useState<'tabs' | 'kanban'>('tabs');
   const [savedView, setSavedView] = useState<'tabs' | 'kanban'>('tabs');
+  const [tts, setTts] = useState(false);
+  const [savedTts, setSavedTts] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -171,18 +173,24 @@ function KdsDefaultViewCard() {
       const v = res.data?.kds_default_view === 'kanban' ? 'kanban' : 'tabs';
       setView(v);
       setSavedView(v);
+      const tt = res.data?.kds_tts_enabled === true;
+      setTts(tt);
+      setSavedTts(tt);
     }).catch(() => {});
   }, []);
 
-  const dirty = view !== savedView;
+  const dirty = view !== savedView || tts !== savedTts;
 
   async function save() {
     setSaving(true);
     try {
-      const { data } = await api.put('/settings/kds', { kds_default_view: view });
+      const { data } = await api.put('/settings/kds', { kds_default_view: view, kds_tts_enabled: tts });
       const next = data?.kds_default_view === 'kanban' ? 'kanban' : 'tabs';
       setSavedView(next);
       setView(next);
+      const tt = data?.kds_tts_enabled === true;
+      setSavedTts(tt);
+      setTts(tt);
       toast.success(t('settings.kdsViewSaved'));
     } catch {
       toast.error(t('settings.kdsViewSaveFailed'));
@@ -230,6 +238,21 @@ function KdsDefaultViewCard() {
           </div>
           <p className="text-xs text-gray-500 ml-6">{t('settings.kdsDefaultViewKanbanHint')}</p>
         </button>
+      </div>
+
+      <div className="mt-6 pt-5 border-t border-gray-100">
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={tts}
+            onChange={(e) => setTts(e.target.checked)}
+            className="mt-1 w-4 h-4 rounded text-brand"
+          />
+          <div>
+            <span className="font-medium text-gray-900">{t('settings.kdsTts')}</span>
+            <p className="text-xs text-gray-500 mt-0.5">{t('settings.kdsTtsHint')}</p>
+          </div>
+        </label>
       </div>
 
       <div className="flex justify-end mt-5 pt-4 border-t border-gray-100">

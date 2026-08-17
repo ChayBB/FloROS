@@ -30,8 +30,9 @@ function useKdsEnabledCheck(): boolean | null {
 // `/api/settings/kds` but not `/api/kds/info` (that one lives on the
 // standalone KDS server). Fetch the default view from the main API instead
 // of `useServerKdsInfo` so chef toggles reflect admin-set defaults here.
-function useDashboardKdsDefault(): KdsViewMode | null {
+function useDashboardKdsDefault(): { view: KdsViewMode | null; tts: boolean } {
   const [view, setView] = useState<KdsViewMode | null>(null);
+  const [tts, setTts] = useState(false);
   useEffect(() => {
     let cancelled = false;
     api
@@ -39,19 +40,20 @@ function useDashboardKdsDefault(): KdsViewMode | null {
       .then(({ data }) => {
         if (cancelled) return;
         setView(data?.kds_default_view === 'kanban' ? 'kanban' : 'tabs');
+        setTts(data?.kds_tts_enabled === true);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, []);
-  return view;
+  return { view, tts };
 }
 
 export default function KdsPage() {
   useSyncServerLanguage();
   const conn = useKdsConnection({ api });
-  const kdsDefaultView = useDashboardKdsDefault();
+  const { view: kdsDefaultView, tts: kdsTtsDefault } = useDashboardKdsDefault();
   const kdsEnabled = useKdsEnabledCheck();
 
   if (kdsEnabled === null) {
@@ -84,5 +86,5 @@ export default function KdsPage() {
     );
   }
   if (!conn.user) return <KdsLoginForm conn={conn} />;
-  return <KdsWorkspace conn={conn} serverDefault={kdsDefaultView} />;
+  return <KdsWorkspace conn={conn} serverDefault={kdsDefaultView} ttsDefault={kdsTtsDefault} />;
 }

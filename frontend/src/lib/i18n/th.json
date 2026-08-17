@@ -1692,5 +1692,7 @@
   "kds.ttsEnable": "อ่านออกเสียงออเดอร์ใหม่",
   "kds.ttsDisable": "ปิดเสียงประกาศออเดอร์",
   "kds.ttsNewOrder": "ออเดอร์ใหม่ {where} {items}",
-  "kds.ttsTableLabel": "โต๊ะ {table}"
+  "kds.ttsTableLabel": "โต๊ะ {table}",
+  "settings.kdsTts": "อ่านออกเสียงออเดอร์ใหม่ที่จอครัว",
+  "settings.kdsTtsHint": "เปิดเสียงประกาศออเดอร์ใหม่เป็นค่าเริ่มต้นทุกจอครัว แต่ละจอยังปิด/เปิดเองได้จากปุ่มลำโพง"
 }

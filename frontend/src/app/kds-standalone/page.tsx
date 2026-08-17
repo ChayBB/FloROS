@@ -67,7 +67,7 @@ export default function KdsStandalonePage() {
   };
   const conn = useKdsConnection(api ? { api, endpoints: standaloneEndpoints } : { api: axios.create() });
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
-  const { kdsDefaultView } = useServerKdsInfo(origin);
+  const { kdsDefaultView, ttsEnabled } = useServerKdsInfo(origin);
   const kdsDisabled = useKdsDisabledCheck(origin);
 
   if (kdsDisabled) {
@@ -89,5 +89,5 @@ export default function KdsStandalonePage() {
     );
   }
   if (!conn.user) return <KdsLoginForm conn={conn} />;
-  return <KdsWorkspace conn={conn} serverDefault={kdsDefaultView} />;
+  return <KdsWorkspace conn={conn} serverDefault={kdsDefaultView} ttsDefault={ttsEnabled} />;
 }

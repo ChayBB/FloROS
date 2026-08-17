@@ -175,6 +175,7 @@ export function startKdsServer(): Promise<void> {
           language: s.language || null,
           country: s.country || null,
           kds_default_view: s.kds_default_view === 'kanban' ? 'kanban' : 'tabs',
+          kds_tts_enabled: s.kds_tts_enabled === '1',
         });
       } catch (error: any) {
         console.error("[API] Internal error:", error);

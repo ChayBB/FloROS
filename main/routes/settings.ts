@@ -365,6 +365,7 @@ router.get('/kds', (_req: Request, res: Response) => {
     const s = getAllSettings(getDatabase());
     res.json({
       kds_default_view: s.kds_default_view === 'kanban' ? 'kanban' : 'tabs',
+      kds_tts_enabled: s.kds_tts_enabled === '1',
     });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
@@ -374,16 +375,21 @@ router.get('/kds', (_req: Request, res: Response) => {
 
 router.put('/kds', requireRole('owner', 'manager'), (req: Request, res: Response) => {
   try {
-    const { kds_default_view } = req.body;
+    const { kds_default_view, kds_tts_enabled } = req.body;
     if (kds_default_view !== undefined && !['tabs', 'kanban'].includes(kds_default_view)) {
       return res.status(400).json({ error: 'kds_default_view must be "tabs" or "kanban"' });
     }
-    if (kds_default_view !== undefined) {
-      upsertSettings(getDatabase(), { kds_default_view });
+    if (kds_tts_enabled !== undefined && typeof kds_tts_enabled !== 'boolean') {
+      return res.status(400).json({ error: 'kds_tts_enabled must be a boolean' });
     }
+    const patch: Record<string, string> = {};
+    if (kds_default_view !== undefined) patch.kds_default_view = kds_default_view;
+    if (kds_tts_enabled !== undefined) patch.kds_tts_enabled = kds_tts_enabled ? '1' : '0';
+    if (Object.keys(patch).length) upsertSettings(getDatabase(), patch);
     const s = getAllSettings(getDatabase());
     res.json({
       kds_default_view: s.kds_default_view === 'kanban' ? 'kanban' : 'tabs',
+      kds_tts_enabled: s.kds_tts_enabled === '1',
     });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
