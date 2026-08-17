@@ -93,6 +93,7 @@
     "test:edge-qr": "node tests/run-electron-node-test.cjs tests/edge-qr.test.ts",
     "test:edge-sync": "node tests/run-electron-node-test.cjs tests/edge-sync.test.ts",
     "test:menu-bundle": "node tests/run-electron-node-test.cjs tests/menu-bundle.test.ts",
+    "test:kds-announcer": "ts-node --transpile-only -P tests/tsconfig.json tests/kds-announcer.test.ts",
     "test:order-numbering-settings": "node tests/run-electron-node-test.cjs tests/order-numbering-settings.test.ts",
     "test:loyalty-toggle": "node tests/run-electron-node-test.cjs tests/loyalty-toggle.test.ts",
     "test:discount-system": "node tests/run-electron-node-test.cjs tests/discount-system.test.ts",
